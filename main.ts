@@ -1,7 +1,7 @@
 // PNG squeezer: decode a stored RGBA screenshot, reduce its colour type,
 // pick per-row filters, and write it back with a hand-rolled lazy-match
 // DEFLATE (hash chains + length-limited Huffman via package-merge).
-// Node stdlib only, no clock, no randomness, fixed work budget: deterministic.
+// Node stdlib only: no clock, no randomness, fixed work budget — fully deterministic.
 import { inflateSync, deflateSync } from 'node:zlib';
 import { mkdirSync, readdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
