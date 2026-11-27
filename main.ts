@@ -438,33 +438,33 @@ function distCode(dist) {
 }
 
 // Package-merge (Larmore & Hirschberg): the length-limited Huffman code.
-// A symbol's length is its occurrence count in the last list's smallest
-// n-1 packages, counted with multiplicity.
+// list(0) holds the singletons; each round pairs the two smallest entries
+// of the current list into packages for the next list, which holds the
+// singletons again; the last list holds packages only. A symbol's length is
+// its occurrence count in the n-1 smallest packages of the last list,
+// counted with multiplicity.
 function codeLengths(freqs, limit) {
   const n = freqs.length;
-  const first = [];
-  for (let i = 0; i < n; i++) if (freqs[i] > 0) first.push([i, freqs[i]]);
-  if (first.length === 0) return new Uint8Array(n);
-  if (first.length === 1) {
+  const singletons = [];
+  for (let i = 0; i < n; i++) if (freqs[i] > 0) singletons.push({ items: [[i, freqs[i]]], f: freqs[i] });
+  if (singletons.length === 0) return new Uint8Array(n);
+  if (singletons.length === 1) {
     const lengths = new Uint8Array(n);
-    lengths[first[0][0]] = 1;
+    lengths[singletons[0].items[0][0]] = 1;
     return lengths;
   }
-  let list = first.map(([s, f]) => ({ items: [[s, f]], f }));
-  const lists = [list];
-  for (let depth = 1; depth < limit; depth++) {
-    list = list.map((p) => ({ items: p.items, f: p.f }));
-    list.sort((a, b) => a.f - b.f);
-    const next = [];
-    for (let i = 0; i + 1 < list.length; i += 2) {
-      next.push({ items: list[i].items.concat(list[i + 1].items), f: list[i].f + list[i + 1].f });
+  let list = singletons;
+  let last = null;
+  for (let depth = 0; depth < limit; depth++) {
+    const sorted = list.slice().sort((a, b) => a.f - b.f);
+    const packages = [];
+    for (let i = 0; i + 1 < sorted.length; i += 2) {
+      packages.push({ items: sorted[i].items.concat(sorted[i + 1].items), f: sorted[i].f + sorted[i + 1].f });
     }
-    if (next.length === 0) break;
-    list = list.concat(next);
-    lists.push(list);
+    if (depth === limit - 1) last = packages;
+    else list = singletons.concat(packages);
   }
-  const last = lists[lists.length - 1];
-  const take = last.slice().sort((a, b) => a.f - b.f).slice(0, first.length - 1);
+  const take = last.slice().sort((a, b) => a.f - b.f).slice(0, singletons.length - 1);
   const lengths = new Uint8Array(n);
   for (const p of take) {
     for (const [s] of p.items) lengths[s]++;
@@ -478,6 +478,19 @@ function reverseBits(code, len) {
     r = (r << 1) | ((code >>> i) & 1);
   }
   return r;
+}
+
+// A length array is a usable complete prefix code when every used symbol
+// has a length inside the limit and the Kraft sum is exactly one.
+function validLengths(freqs, lengths, limit) {
+  let kraft = 0;
+  for (let i = 0; i < freqs.length; i++) {
+    if (freqs[i] > 0) {
+      if (lengths[i] < 1 || lengths[i] > limit) return false;
+      kraft += 1 << (limit - lengths[i]);
+    }
+  }
+  return kraft === (1 << limit);
 }
 
 function canonicalCodes(lengths) {
@@ -562,6 +575,18 @@ class BitWriter {
     if (this.nbits > 0) this.bytes.push(this.acc & 0xff);
     return Uint8Array.from(this.bytes);
   }
+
+  clone() {
+    const w = new BitWriter();
+    w.bytes = [...this.bytes];
+    w.acc = this.acc;
+    w.nbits = this.nbits;
+    return w;
+  }
+
+  bitLength() {
+    return this.bytes.length * 8 + this.nbits;
+  }
 }
 
 // ---------------------------------------------------------------- LZ77 + blocks
@@ -580,95 +605,85 @@ function hashOf(data, pos) {
 const FIXED_LITLEN_LEN = new Uint8Array(288).fill(8, 0, 144).fill(9, 144, 256).fill(7, 256, 280).fill(8, 280);
 const FIXED_DIST_LEN = new Uint8Array(30).fill(5);
 
-// Lazy-match parse: at each position the best match found; when a match of
-// length 1 starts, the next position's match is tried too and kept if longer.
+// Lazy-match parse: at each position the best match found; when a match
+// starts, the next position's match is tried too and kept if longer.
+// Positions enter the hash chains only as the parse advances past them, so
+// every chain entry lies strictly before the search point.
 function parseBlock(data, start, end, chain, prev, head) {
   const litFreq = new Uint32Array(288);
   const distFreq = new Uint32Array(30);
   const tokens = [];
+  const insert = (i) => {
+    if (i + MIN_MATCH > end) return;
+    const hh = hashOf(data, i);
+    const h0 = head[hh];
+    prev[i] = h0 >= 0 && i - h0 <= MAX_DIST ? h0 : -1;
+    head[hh] = i;
+  };
   let pos = start;
   let len1 = 0;
   let dist1 = 0;
   while (pos < end) {
+    if (len1 !== 0) {
+      tokens.push(len1);
+      tokens.push(dist1);
+      litFreq[257 + lenCode(len1)]++;
+      distFreq[distCode(dist1)]++;
+      insert(pos);
+      for (let i = pos + 1; i < pos + len1; i++) insert(i);
+      pos += len1;
+      len1 = 0;
+      continue;
+    }
     const maxLen = Math.min(MAX_MATCH, end - pos);
     let bestLen = 0;
     let bestDist = 0;
     if (maxLen >= MIN_MATCH) {
       const h = hashOf(data, pos);
-      let dist = pos - head[h];
       let cand = head[h];
       let tries = 0;
-      while (cand >= 0 && dist <= MAX_DIST && tries < chain) {
+      while (cand >= 0 && pos - cand <= MAX_DIST && tries < chain) {
         tries++;
         let len = 0;
         while (len < maxLen && data[cand + len] === data[pos + len]) len++;
-        if (len >= MIN_MATCH && (len > bestLen || (len === bestLen && cand + len < pos))) {
+        if (len >= MIN_MATCH && len > bestLen) {
           bestLen = len;
-          bestDist = dist;
+          bestDist = pos - cand;
           if (len === maxLen) break;
         }
         cand = prev[cand];
-        dist = pos - cand;
       }
       head[h] = pos;
       prev[pos] = cand;
-      if (bestLen === 0) {
-        for (let i = pos + 1; i < Math.min(pos + MIN_MATCH, end); i++) {
-          if (i + MIN_MATCH <= end) {
-            const hh = hashOf(data, i);
-            if (i - head[hh] > MAX_DIST || head[hh] < 0) prev[i] = -1;
-            else prev[i] = head[hh];
-            head[hh] = i;
-          }
-        }
-      } else if (bestLen > 1) {
-        for (let i = pos + 1; i < pos + bestLen; i++) {
-          if (i + MIN_MATCH <= end) {
-            const hh = hashOf(data, i);
-            if (i - head[hh] > MAX_DIST || head[hh] < 0) prev[i] = -1;
-            else prev[i] = head[hh];
-            head[hh] = i;
-          }
-        }
-      }
     }
     if (bestLen >= MIN_MATCH) {
-      if (len1 !== 0) {
-        tokens.push(len1);
-        tokens.push(dist1);
-        litFreq[257 + lenCode(len1)]++;
-        distFreq[distCode(dist1)]++;
-        len1 = 0;
-      }
-      if (pos + 1 < end && bestLen > 1) {
+      if (pos + 1 < end) {
         const m2 = Math.min(MAX_MATCH, end - pos - 1);
         let l2 = 0;
         let d2 = 0;
         if (m2 >= MIN_MATCH) {
           const h = hashOf(data, pos + 1);
-          let dist = pos + 1 - head[h];
           let cand = head[h];
           let tries = 0;
-          while (cand >= 0 && dist <= MAX_DIST && tries < chain) {
+          while (cand >= 0 && pos + 1 - cand <= MAX_DIST && tries < chain) {
             tries++;
             let len = 0;
             while (len < m2 && data[cand + len] === data[pos + 1 + len]) len++;
             if (len >= MIN_MATCH && len > l2) {
               l2 = len;
-              d2 = dist;
+              d2 = pos + 1 - cand;
               if (len === m2) break;
             }
             cand = prev[cand];
-            dist = pos + 1 - cand;
           }
         }
         if (l2 > bestLen) {
-          const b = data[pos];
-          tokens.push(b);
-          litFreq[b]++;
-          pos++;
+          tokens.push(data[pos]);
+          tokens.push(0);
+          litFreq[data[pos]]++;
           len1 = l2;
           dist1 = d2;
+          pos++;
           continue;
         }
       }
@@ -676,17 +691,12 @@ function parseBlock(data, start, end, chain, prev, head) {
       tokens.push(bestDist);
       litFreq[257 + lenCode(bestLen)]++;
       distFreq[distCode(bestDist)]++;
+      for (let i = pos + 1; i < pos + bestLen; i++) insert(i);
       pos += bestLen;
       continue;
     }
-    if (len1 !== 0) {
-      tokens.push(len1);
-      tokens.push(dist1);
-      litFreq[257 + lenCode(len1)]++;
-      distFreq[distCode(dist1)]++;
-      len1 = 0;
-    }
     tokens.push(data[pos]);
+    tokens.push(0);
     litFreq[data[pos]]++;
     pos++;
   }
@@ -700,8 +710,10 @@ function parseBlock(data, start, end, chain, prev, head) {
   return { tokens, litFreq, distFreq };
 }
 
-// Write one dynamic-Huffman block (or fixed, or stored when that is
-// smaller). The caller owns BFINAL.
+// Write one dynamic-Huffman block (or fixed, when that is smaller). The
+// caller owns BFINAL. Each candidate starts from a clone of the shared
+// writer, so the winner continues at the current bit position instead of a
+// fresh byte boundary.
 function writeBlock(w, tokens, litFreq, distFreq, last) {
   const litLen = codeLengths(litFreq, 15);
   const distLen = codeLengths(distFreq, 15);
@@ -721,62 +733,65 @@ function writeBlock(w, tokens, litFreq, distFreq, last) {
   const clCode = canonicalCodes(clLen);
   const litCode = canonicalCodes(litLen);
   const distCodeMap = canonicalCodes(distLen);
-  const wDyn = new BitWriter();
-  wDyn.write(last ? 1 : 0, 1);
-  wDyn.write(2, 2);
-  wDyn.write(hlit - 257, 5);
-  wDyn.write(hdist - 1, 5);
-  wDyn.write(hclen - 4, 4);
-  for (let i = 0; i < hclen; i++) wDyn.write(clLen[CL_PERM[i]], 3);
-  for (const [sym, extra] of tokens2) {
-    wDyn.write(clCode[sym], clLen[sym]);
-    if (sym === 16 || sym === 17 || sym === 18) wDyn.write(extra, CL_EXTRA[sym]);
-  }
-  for (let i = 0; i < tokens.length; i += 2) {
-    const a = tokens[i];
-    const b = tokens[i + 1];
-    if (a < 257) wDyn.write(litCode[a], litLen[a]);
-    else {
-      const lc = a - 257;
-      wDyn.write(litCode[257 + lc], litLen[257 + lc]);
-      if (LEN_EXTRA[lc] > 0) wDyn.write(a - LEN_BASE[lc], LEN_EXTRA[lc]);
-      const dc = distCode(b);
-      wDyn.write(distCodeMap[dc], distLen[dc]);
-      if (DIST_EXTRA[dc] > 0) wDyn.write(b - DIST_BASE[dc], DIST_EXTRA[dc]);
+  const dynOk = validLengths(litFreq, litLen, 15) && validLengths(distFreq, distLen, 15) && validLengths(clFreq, clLen, 7);
+  let winner = null;
+  let winnerBits = Infinity;
+  if (dynOk) {
+    const wd = w.clone();
+    wd.write(last ? 1 : 0, 1);
+    wd.write(2, 2);
+    wd.write(hlit - 257, 5);
+    wd.write(hdist - 1, 5);
+    wd.write(hclen - 4, 4);
+    for (let i = 0; i < hclen; i++) wd.write(clLen[CL_PERM[i]], 3);
+    for (const [sym, extra] of tokens2) {
+      wd.write(clCode[sym], clLen[sym]);
+      if (sym === 16 || sym === 17 || sym === 18) wd.write(extra, CL_EXTRA[sym]);
+    }
+    for (let i = 0; i < tokens.length; i += 2) {
+      const a = tokens[i];
+      const b = tokens[i + 1];
+      if (b === 0) {
+        wd.write(litCode[a], litLen[a]);
+      } else {
+        const lc = lenCode(a);
+        wd.write(litCode[257 + lc], litLen[257 + lc]);
+        if (LEN_EXTRA[lc] > 0) wd.write(a - LEN_BASE[lc], LEN_EXTRA[lc]);
+        const dc = distCode(b);
+        wd.write(distCodeMap[dc], distLen[dc]);
+        if (DIST_EXTRA[dc] > 0) wd.write(b - DIST_BASE[dc], DIST_EXTRA[dc]);
+      }
+    }
+    wd.write(litCode[256], litLen[256]);
+    if (wd.bitLength() < winnerBits) {
+      winnerBits = wd.bitLength();
+      winner = wd;
     }
   }
-  wDyn.write(litCode[256], litLen[256]);
-  const wFixed = new BitWriter();
-  wFixed.write(last ? 1 : 0, 1);
-  wFixed.write(1, 2);
+  const wf = w.clone();
+  wf.write(last ? 1 : 0, 1);
+  wf.write(1, 2);
   const fl = canonicalCodes(FIXED_LITLEN_LEN);
   const fd = canonicalCodes(FIXED_DIST_LEN);
   for (let i = 0; i < tokens.length; i += 2) {
     const a = tokens[i];
     const b = tokens[i + 1];
-    if (a < 257) wFixed.write(fl[a], FIXED_LITLEN_LEN[a]);
-    else {
-      const lc = a - 257;
-      wFixed.write(fl[257 + lc], FIXED_LITLEN_LEN[257 + lc]);
-      if (LEN_EXTRA[lc] > 0) wFixed.write(a - LEN_BASE[lc], LEN_EXTRA[lc]);
+    if (b === 0) {
+      wf.write(fl[a], FIXED_LITLEN_LEN[a]);
+    } else {
+      const lc = lenCode(a);
+      wf.write(fl[257 + lc], FIXED_LITLEN_LEN[257 + lc]);
+      if (LEN_EXTRA[lc] > 0) wf.write(a - LEN_BASE[lc], LEN_EXTRA[lc]);
       const dc = distCode(b);
-      wFixed.write(fd[dc], FIXED_DIST_LEN[dc]);
-      if (DIST_EXTRA[dc] > 0) wFixed.write(b - DIST_BASE[dc], DIST_EXTRA[dc]);
+      wf.write(fd[dc], FIXED_DIST_LEN[dc]);
+      if (DIST_EXTRA[dc] > 0) wf.write(b - DIST_BASE[dc], DIST_EXTRA[dc]);
     }
   }
-  wFixed.write(fl[256], FIXED_LITLEN_LEN[256]);
-  const dynBytes = wDyn.finish();
-  const fixedBytes = wFixed.finish();
-  const dynOk = clFreq.every((f, s) => f === 0 || clLen[s] > 0) && litLen[256] > 0;
-  if (dynOk && dynBytes.length <= fixedBytes.length) {
-    w.bytes.push(...dynBytes);
-    w.acc = 0;
-    w.nbits = 0;
-  } else {
-    w.bytes.push(...fixedBytes);
-    w.acc = 0;
-    w.nbits = 0;
-  }
+  wf.write(fl[256], FIXED_LITLEN_LEN[256]);
+  if (wf.bitLength() < winnerBits) winner = wf;
+  w.bytes = winner.bytes;
+  w.acc = winner.acc;
+  w.nbits = winner.nbits;
 }
 
 // The custom deflate: lazy-parse each block, write it, then the final bit.
