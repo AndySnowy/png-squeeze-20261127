@@ -596,7 +596,7 @@ const MAX_MATCH = 258;
 const HASH_BITS = 15;
 const HASH_SIZE = 1 << HASH_BITS;
 const MAX_DIST = 32768;
-const BLOCK_INPUT = 131072;
+const BLOCK_INPUT = 262144;
 
 function hashOf(data, pos) {
   return ((data[pos] << 16) ^ (data[pos + 1] << 8) ^ data[pos + 2]) * 2654435761 >>> (32 - HASH_BITS);
@@ -653,8 +653,8 @@ function parseBlock(data, start, end, chain, prev, head) {
         }
         cand = prev[cand];
       }
+      prev[pos] = head[h];
       head[h] = pos;
-      prev[pos] = cand;
     }
     if (bestLen >= MIN_MATCH) {
       if (pos + 1 < end) {
